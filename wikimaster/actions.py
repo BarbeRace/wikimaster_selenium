@@ -5,6 +5,7 @@ un résultat simple. Pour ajouter une action : écrire la fonction ici, puis
 l'ajouter à la liste ACTIONS en bas de fichier (un bouton apparaîtra dans l'UI).
 """
 
+import re
 import unicodedata
 from collections.abc import Callable
 
@@ -74,8 +75,18 @@ def login(log: Log = _noop, wait_user: float = 180) -> None:
     log("Connexion réussie")
 
 
+SELECTION_ON_XPATH = "//button[contains(normalize-space(), 'Quitter la sélection')]"
+
+
+def _pill_xpath(rarity: str) -> str:
+    return f"//button[normalize-space()='{rarity}']"
+
+
 def _rarity_pill(rarity: str):
-    return wait_for((By.XPATH, f"//button[normalize-space()='{rarity}']"))
+    # Sur une fenêtre étroite, les pastilles sont masquées derrière le menu « Rareté »
+    if not any(p.is_displayed() for p in browser.get_driver().find_elements(By.XPATH, _pill_xpath(rarity))):
+        click((By.XPATH, "//button[normalize-space()='Rareté']"))
+    return wait_for((By.XPATH, _pill_xpath(rarity)))
 
 
 def _is_selected(pill) -> bool:
@@ -83,24 +94,27 @@ def _is_selected(pill) -> bool:
     return "opacity-50" not in pill.get_attribute("class")
 
 
-def cartes_communes(log: Log = _noop) -> None:
-    """Va sur la collection : rareté Commune, sans étiquette, mode sélection activé."""
+def cartes_rarete(rarity: str, rarity_label: str, log: Log = _noop) -> None:
+    """Va sur la collection : rareté donnée, sans étiquette, mode sélection activé.
+
+    `rarity` est le libellé de la pastille (C, PC, R...), `rarity_label` le nom affiché dans les logs.
+    """
     driver = browser.get_driver()
     go_to("/collection", log)
-    pill = _rarity_pill("C")
+    pill = _rarity_pill(rarity)
 
     reset = driver.find_elements(By.XPATH, "//button[contains(normalize-space(), 'Réinitialiser rareté')]")
     if reset:  # un autre filtre de rareté est déjà actif
         reset[0].click()
-        pill = _rarity_pill("C")
+        pill = _rarity_pill(rarity)
     if not _is_selected(pill):
         pill.click()
 
     WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(
-        lambda d: _is_selected(_rarity_pill("C"))
+        lambda d: _is_selected(d.find_element(By.XPATH, _pill_xpath(rarity)))
         and d.find_elements(By.XPATH, "//button[contains(normalize-space(), 'Réinitialiser rareté')]")
     )
-    log("Filtre rareté : Commune")
+    log(f"Filtre rareté : {rarity_label}")
 
     label_dropdown = driver.find_element(By.CSS_SELECTOR, "button[aria-haspopup=listbox]")
     if label_dropdown.text.strip() != "Sans étiquette":
@@ -112,10 +126,21 @@ def cartes_communes(log: Log = _noop) -> None:
         )
     log("Filtre étiquette : Sans étiquette")
 
-    if not driver.find_elements(By.XPATH, "//button[contains(normalize-space(), 'Quitter la sélection')]"):
-        click((By.XPATH, "//button[normalize-space()='Sélectionner']"))
-        wait_for((By.XPATH, "//button[contains(normalize-space(), 'Quitter la sélection')]"))
+    _ensure_selection_mode()
     log("Mode sélection activé")
+
+
+def cartes_communes(log: Log = _noop) -> None:
+    """Va sur la collection : rareté Commune, sans étiquette, mode sélection activé."""
+    cartes_rarete("C", "Commune", log)
+
+
+def _ensure_selection_mode() -> None:
+    # Le site désactive le mode sélection après un étiquetage : on le réactive si besoin
+    driver = browser.get_driver()
+    if not driver.find_elements(By.XPATH, SELECTION_ON_XPATH):
+        click((By.XPATH, "//button[normalize-space()='Sélectionner']"))
+        wait_for((By.XPATH, SELECTION_ON_XPATH))
 
 
 def close_browser(log: Log = _noop) -> None:
@@ -124,7 +149,9 @@ def close_browser(log: Log = _noop) -> None:
 
 
 DEFAUSSE_LABEL = "Defausse"
-CARD_SELECTOR = ".glow-c"  # une carte de collection (h3 = titre, p = description)
+CARD_SELECTOR = "[class*='glow-']"  # une carte de collection (classe glow-<rareté>, h3 = titre, p = description)
+CARDS_PER_PAGE = 50
+MAX_ROUNDS = 200  # garde-fou contre une boucle infinie
 
 
 def _normalize(text: str) -> str:
@@ -170,47 +197,157 @@ def _selected_count(driver) -> int:
     )
 
 
-def _click_card(card: WebElement) -> None:
-    # Une carte en bas de la vue passe sous la barre d'outils fixe : on la recentre d'abord
-    browser.get_driver().execute_script("arguments[0].scrollIntoView({block: 'center'});", card)
-    card.click()
+def _page_info(driver) -> tuple[int, int] | None:
+    """(page courante, nombre de pages) d'après « Page X / Y », None si absent."""
+    match = re.search(r"Page (\d+) / (\d+)", driver.find_element(By.TAG_NAME, "body").text)
+    return (int(match[1]), int(match[2])) if match else None
+
+
+def _go_to_page(driver, target: int) -> bool:
+    """Va à la page `target` avec Suivant/Précédent. Retourne False si elle n'existe pas."""
+    info = _page_info(driver)
+    if info is None:
+        return False
+    current, last = info
+    if not 1 <= target <= last:
+        return False
+    while current != target:
+        step = 1 if target > current else -1
+        keyword = "Suivant" if step > 0 else "Précédent"
+        buttons = [b for b in driver.find_elements(By.TAG_NAME, "button") if keyword in b.text]
+        if not buttons or not buttons[0].is_enabled():
+            return False
+        before = _snapshot(driver)
+        _click_element(buttons[0])
+        expected = current + step
+        try:
+            WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(
+                lambda d: (_page_info(d) or (0, 0))[0] == expected and _snapshot(d) != before
+            )
+        except TimeoutException:
+            return False
+        current = expected
+    return True
+
+
+def _click_element(element: WebElement) -> None:
+    # Un élément en bas de la vue passe sous la barre d'outils fixe : on le recentre d'abord
+    browser.get_driver().execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+    element.click()
 
 
 def _apply_label() -> None:
     click((By.XPATH, "//button[normalize-space()='Étiqueter']"))
     click((By.XPATH, f"//button[normalize-space()='{DEFAUSSE_LABEL}']"))
+    _close_label_modal()
+    _restart_selection_mode()
 
 
-def defausse_communes(log: Log = _noop) -> int:
-    """Étiquette « Defausse » les cartes communes de la page affichée, sans mot-clé (titre ou description).
+def _close_label_modal() -> None:
+    # La modale « Appliquer une étiquette » peut rester ouverte : elle masquerait les cartes suivantes
+    driver = browser.get_driver()
+    overlay_gone = lambda d: not d.find_elements(By.CSS_SELECTOR, ".fixed.inset-0")
+    try:
+        WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(overlay_gone)
+    except TimeoutException:
+        close = driver.find_elements(By.CSS_SELECTOR, ".fixed.inset-0 button[aria-label='Fermer']")
+        if close:
+            driver.execute_script("arguments[0].click();", close[0])
+        WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(overlay_gone)
 
-    Une exécution traite une seule page : pour la suivante, on relance l'action.
-    Aucune vérification de l'affichage après étiquetage.
-    Retourne le nombre de cartes étiquetées.
+
+def _close_overlay() -> None:
+    driver = browser.get_driver()
+    for button in driver.find_elements(By.CSS_SELECTOR, ".fixed.inset-0 button[aria-label='Fermer']"):
+        button.click()
+    WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(
+        lambda d: not d.find_elements(By.CSS_SELECTOR, ".fixed.inset-0")
+    )
+
+
+def _restart_selection_mode() -> None:
+    # Après un étiquetage, « Quitter la sélection » reste affiché mais le mode est inactif :
+    # un clic sur une carte ouvrirait alors la modale d'étiquetage. On le désactive puis réactive.
+    driver = browser.get_driver()
+    if driver.find_elements(By.XPATH, SELECTION_ON_XPATH):
+        click((By.XPATH, SELECTION_ON_XPATH))
+        WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(
+            lambda d: not d.find_elements(By.XPATH, SELECTION_ON_XPATH)
+        )
+    _ensure_selection_mode()
+
+
+def defausse_rarete(rarity: str, rarity_label: str, log: Log = _noop) -> int:
+    """Étiquette « Defausse » les cartes d'une rareté sans mot-clé (titre ou description), sur toutes les pages.
+
+    Les cartes conservées restent dans la vue « Sans étiquette » et la liste se raccourcit à chaque
+    étiquetage : on ne passe donc pas simplement à la page suivante, on repart de la première carte
+    non traitée (sinon des cartes seraient sautées). Pas de vérification de l'affichage après étiquetage.
+    La fonction s'arrête quand la page demandée n'existe plus. Retourne le nombre de cartes étiquetées.
     """
     keywords = _load_keywords()
-    cartes_communes(log)
+    cartes_rarete(rarity, rarity_label, log)
     driver = browser.get_driver()
     try:
-        WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(lambda d: _snapshot(d))
+        WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(
+            lambda d: _page_info(d) is not None and _snapshot(d)
+        )
     except TimeoutException:
         log("Aucune carte commune affichée")
         return 0
 
-    texts = _snapshot(driver)
-    to_label = [i for i, text in enumerate(texts) if not _has_keyword(text, keywords)]
-    if not to_label:
-        log("Aucune carte à défausser sur cette page")
-        return 0
+    total = 0
+    kept = 0  # cartes conservées : elles occupent toujours le début de la liste
+    previous: list[str] | None = None  # liste avant le dernier étiquetage
+    for _ in range(MAX_ROUNDS):
+        if previous is not None:
+            # Attend le rafraîchissement de la liste après étiquetage (la liste se raccourcit)
+            try:
+                WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(lambda d: _snapshot(d) != previous)
+            except TimeoutException:
+                log("L'affichage ne s'est pas mis à jour après étiquetage : relance le bouton")
+                break
+        page, offset = kept // CARDS_PER_PAGE + 1, kept % CARDS_PER_PAGE
+        if not _go_to_page(driver, page):
+            log("Fin : la page suivante n'existe plus")
+            break
+        texts = _snapshot(driver)
+        if len(texts) <= offset:
+            log("Fin : plus de cartes à traiter")
+            break
+        to_label = [i for i, text in enumerate(texts) if not _has_keyword(text, keywords)]
+        if to_label:
+            _ensure_selection_mode()
+            cards = driver.find_elements(By.CSS_SELECTOR, CARD_SELECTOR)
+            for i in to_label:
+                _click_element(cards[i])
+                # Un clic peut ouvrir une modale d'étiquetage « 1 carte » : on la ferme, la sélection reste
+                if driver.find_elements(By.CSS_SELECTOR, ".fixed.inset-0"):
+                    _close_overlay()
+            if _selected_count(driver) != len(to_label):
+                raise RuntimeError("La sélection des cartes a échoué")
+            _apply_label()
+            previous = texts
+            total += len(to_label)
+            log(f"Page {page} : {len(to_label)} carte(s) étiquetée(s) « {DEFAUSSE_LABEL} »")
+        kept = (page - 1) * CARDS_PER_PAGE + len(texts) - len(to_label)
+    log(f"Terminé : {total} carte(s) étiquetée(s) « {DEFAUSSE_LABEL} »")
+    return total
 
-    cards = driver.find_elements(By.CSS_SELECTOR, CARD_SELECTOR)
-    for i in to_label:
-        _click_card(cards[i])
-    if _selected_count(driver) != len(to_label):
-        raise RuntimeError("La sélection des cartes a échoué")
-    _apply_label()
-    log(f"{len(to_label)} carte(s) étiquetée(s) « {DEFAUSSE_LABEL} »")
-    return len(to_label)
+
+def defausse_communes(log: Log = _noop) -> int:
+    """Défausse les cartes communes sans mot-clé, sur toutes les pages."""
+    return defausse_rarete("C", "Commune", log)
+
+
+def defausse_peu_communes(log: Log = _noop) -> int:
+    """Défausse les cartes peu communes sans mot-clé, sur toutes les pages."""
+    return defausse_rarete("PC", "Peu commune", log)
+
+
+def defausse_rares(log: Log = _noop) -> int:
+    """Défausse les cartes rares sans mot-clé, sur toutes les pages."""
+    return defausse_rarete("R", "Rare", log)
 
 
 # (libellé du bouton, fonction)
@@ -218,5 +355,7 @@ ACTIONS: list[tuple[str, Callable[[Log], object]]] = [
     ("Se connecter", login),
     ("Cartes communes", cartes_communes),
     ("Défausse communes", defausse_communes),
+    ("Défausse peu communes", defausse_peu_communes),
+    ("Défausse rares", defausse_rares),
     ("Fermer le navigateur", close_browser),
 ]

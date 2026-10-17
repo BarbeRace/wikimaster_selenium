@@ -1,0 +1,11 @@
+{
+  "VsCodeTaskButtons.showCounter": false,
+  "VsCodeTaskButtons.tasks": [
+    {
+      "label": "$(play) Lancer wikimaster",
+      "task": "Lancer wikimaster",
+      "alignment": "left",
+      "tooltip": "Lancer l'interface wikimaster (python main.py)"
+    }
+  ]
+}
