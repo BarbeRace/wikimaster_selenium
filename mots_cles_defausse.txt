@@ -44,3 +44,6 @@ pistolet
 fusil
 canon
 bateau
+piano
+clavier
+synthé
