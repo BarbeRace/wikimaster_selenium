@@ -1,0 +1,2 @@
+selenium>=4.51
+customtkinter>=5.2

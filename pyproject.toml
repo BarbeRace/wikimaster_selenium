@@ -1,0 +1,9 @@
+[project]
+name = "wikimaster-selenium"
+version = "0.1.0"
+description = "Automatisation de Wiki Masters avec Selenium + Chrome"
+requires-python = ">=3.13"
+dependencies = [
+    "selenium>=4.51",
+    "customtkinter>=5.2",
+]
