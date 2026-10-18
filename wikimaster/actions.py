@@ -197,10 +197,20 @@ def _selected_count(driver) -> int:
     )
 
 
+NAV_BUTTON_XPATH = "//button[contains(., 'Suivant') or contains(., 'Précédent')]"
+
+
 def _page_info(driver) -> tuple[int, int] | None:
-    """(page courante, nombre de pages) d'après « Page X / Y », None si absent."""
+    """(page courante, nombre de pages) d'après « Page X / Y », None si rien n'est affiché.
+
+    Avec une seule page, le site n'affiche ni « Page X / Y » ni boutons de navigation : on renvoie (1, 1).
+    """
     match = re.search(r"Page (\d+) / (\d+)", driver.find_element(By.TAG_NAME, "body").text)
-    return (int(match[1]), int(match[2])) if match else None
+    if match:
+        return int(match[1]), int(match[2])
+    if driver.find_elements(By.XPATH, NAV_BUTTON_XPATH) or not _snapshot(driver):
+        return None
+    return 1, 1
 
 
 def _go_to_page(driver, target: int) -> bool:
