@@ -6,10 +6,16 @@ BASE_URL = "https://www.wiki-masters.com/"
 ROOT_DIR = Path(__file__).resolve().parent.parent
 # Profil Chrome dédié : conserve cookies/session entre les lancements (reste connecté).
 PROFILE_DIR = ROOT_DIR / "chrome_profile"
-# Un mot-clé par ligne (insensible à la casse et aux accents, recherche par sous-chaîne)
-DEFAUSSE_KEYWORDS_FILE = ROOT_DIR / "mots_cles_defausse.txt"
+# Listes de mots-clés : un mot-clé par ligne (insensible à la casse et aux accents, recherche par sous-chaîne)
+KEYWORDS_DIR = ROOT_DIR / "mots_cles"
+DEFAUSSE_KEYWORDS_FILE = KEYWORDS_DIR / "mots_cles_defausse.txt"
+TAG_AFRIQUE_KEYWORDS_FILE = KEYWORDS_DIR / "mots_cles_tag_afrique.txt"
+TAG_OISEAUX_KEYWORDS_FILE = KEYWORDS_DIR / "mots_cles_oiseaux.txt"
+TAG_REPTILES_KEYWORDS_FILE = KEYWORDS_DIR / "mots_cles_reptiles.txt"
+TAG_CUISINE_KEYWORDS_FILE = KEYWORDS_DIR / "mots_cles_cuisine.txt"
 
 DEFAULT_TIMEOUT = 15  # secondes, pour les attentes explicites
+LABEL_LIST_TIMEOUT = 10  # secondes d'attente de la liste d'étiquettes ; au-delà, la page est rafraîchie et la défausse relancée
 LOGIN_URL = BASE_URL + "login"
 
 

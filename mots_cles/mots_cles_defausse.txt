@@ -61,3 +61,13 @@ Lyon
 Grenoble
 Crolles
 chartreuse
+voiture
+automo
+spatial
+mali
+bénin
+fiat
+renault
+croiseur
+stellaire
+étoile
