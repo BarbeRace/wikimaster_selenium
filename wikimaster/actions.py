@@ -390,11 +390,6 @@ def defausse_rarete(rarity: str, rarity_label: str, log: Log = _noop) -> int:
     return _tag_collection(rarity, rarity_label, config.DEFAUSSE_KEYWORDS_FILE, False, DEFAUSSE_LABEL, log)
 
 
-def tag_afrique(log: Log = _noop) -> int:
-    """Étiquette « Afrique & co » les cartes de toutes les raretés contenant un mot-clé africain, sur toutes les pages."""
-    return _tag_collection(None, "Toutes raretés", config.TAG_AFRIQUE_KEYWORDS_FILE, True, AFRIQUE_LABEL, log)
-
-
 def defausse_communes(log: Log = _noop) -> int:
     """Défausse les cartes communes sans mot-clé, sur toutes les pages."""
     return defausse_rarete("C", "Commune", log)
@@ -424,7 +419,8 @@ def defausse_tout(log: Log = _noop) -> int:
 
 
 API_RARITIES = [("C", "Commune"), ("PC", "Peu commune"), ("R", "Rare")]
-API_MAX_SWEEPS = 5
+API_MAX_SWEEPS = 5  # relectures maximum d'une collection pour une fonction
+API_MAX_PAGES = 100  # garde-fou : pages lues par relecture
 API_RETRIES = 3
 
 
@@ -440,12 +436,13 @@ def _api_retry(func, *args):
 
 
 def _tag_collection_api(rarities: list[tuple[str | None, str]], keywords_file: Path, tag_if_match: bool,
-                        tags: tuple[str, ...], log: Log, dry_run: bool = False) -> int:
+                        tags: tuple[str, ...], log: Log, dry_run: bool = False,
+                        labeled_ids: set[str] | None = None) -> int:
     """Étiquette `tags` via l'API les cartes sans étiquette selon la présence d'un mot-clé (titre ou description).
 
     Lit la collection sans étiquette (/api/my-collection) et pose les étiquettes (table Supabase user_card_tags).
-    `rarities` : liste de (code rareté ou None pour toutes, nom affiché). Chaque balayage reprend après les cartes
-    conservées ; on refait des balayages jusqu'à ce qu'un balayage n'étiquette plus rien.
+    `rarities` : liste de (code rareté ou None pour toutes, nom affiché).
+    `labeled_ids` : cartes déjà étiquetées pendant la même exécution (partagé par « Tag » : une carte n'est jamais retouchée).
     `dry_run` : compte sans rien écrire.
     """
     keywords = _load_keywords(keywords_file)
@@ -453,14 +450,11 @@ def _tag_collection_api(rarities: list[tuple[str | None, str]], keywords_file: P
     tag_ids = [_api_retry(api.get_tag_id, tag) for tag in tags]
     names = " + ".join(f"« {tag} »" for tag in tags)
     verb = "à étiqueter" if dry_run else "étiquetée(s)"
+    handled = set() if labeled_ids is None else labeled_ids
+    kept: set[str] = set()  # cartes sans mot-clé pour cette fonction (restent disponibles pour les suivantes)
     total = 0
     for rarity, rarity_label in rarities:
-        rarity_total = 0
-        for _ in range(API_MAX_SWEEPS):
-            labeled = _api_sweep(rarity, keywords, tag_if_match, tag_ids, dry_run, log)
-            rarity_total += labeled
-            if labeled == 0 or dry_run:
-                break
+        rarity_total = _api_sweep(rarity, keywords, tag_if_match, tag_ids, dry_run, handled, kept, log)
         log(f"{rarity_label} : {rarity_total} carte(s) {verb} {names}")
         total += rarity_total
     log(f"Terminé (API) : {total} carte(s) {verb} {names} au total")
@@ -472,48 +466,79 @@ def defausse_api(log: Log = _noop, dry_run: bool = False) -> int:
     return _tag_collection_api(API_RARITIES, config.DEFAUSSE_KEYWORDS_FILE, False, (DEFAUSSE_LABEL,), log, dry_run)
 
 
-def tag_afrique_api(log: Log = _noop, dry_run: bool = False) -> int:
-    """Comme « Tag afrique », mais via l'API : étiquette « Afrique & co » les cartes sans étiquette (toutes raretés) à mot-clé."""
-    return _tag_collection_api([(None, "Toutes raretés")], config.TAG_AFRIQUE_KEYWORDS_FILE, True, (AFRIQUE_LABEL,), log, dry_run)
+def tag_afrique_api(log: Log = _noop, dry_run: bool = False, labeled_ids: set[str] | None = None) -> int:
+    """Étiquette « Afrique & co » via l'API les cartes sans étiquette (toutes raretés) à mot-clé africain."""
+    return _tag_collection_api([(None, "Toutes raretés")], config.TAG_AFRIQUE_KEYWORDS_FILE, True, (AFRIQUE_LABEL,),
+                               log, dry_run, labeled_ids)
 
 
-def tag_oiseaux_api(log: Log = _noop, dry_run: bool = False) -> int:
+def tag_oiseaux_api(log: Log = _noop, dry_run: bool = False, labeled_ids: set[str] | None = None) -> int:
     """Étiquette « Oiseau » et « Animal » via l'API les cartes sans étiquette (toutes raretés) contenant un mot-clé d'oiseaux."""
     return _tag_collection_api([(None, "Toutes raretés")], config.TAG_OISEAUX_KEYWORDS_FILE, True,
-                               (OISEAUX_LABEL, ANIMAL_LABEL), log, dry_run)
+                               (OISEAUX_LABEL, ANIMAL_LABEL), log, dry_run, labeled_ids)
 
 
-def tag_reptiles_api(log: Log = _noop, dry_run: bool = False) -> int:
+def tag_reptiles_api(log: Log = _noop, dry_run: bool = False, labeled_ids: set[str] | None = None) -> int:
     """Étiquette « Reptiles » et « Animal » via l'API les cartes sans étiquette (toutes raretés) contenant un mot-clé de reptiles."""
     return _tag_collection_api([(None, "Toutes raretés")], config.TAG_REPTILES_KEYWORDS_FILE, True,
-                               (REPTILES_LABEL, ANIMAL_LABEL), log, dry_run)
+                               (REPTILES_LABEL, ANIMAL_LABEL), log, dry_run, labeled_ids)
 
 
-def tag_cuisine_api(log: Log = _noop, dry_run: bool = False) -> int:
+def tag_cuisine_api(log: Log = _noop, dry_run: bool = False, labeled_ids: set[str] | None = None) -> int:
     """Étiquette « Cuisine » via l'API les cartes sans étiquette (toutes raretés) contenant un mot-clé de cuisine."""
     return _tag_collection_api([(None, "Toutes raretés")], config.TAG_CUISINE_KEYWORDS_FILE, True,
-                               (CUISINE_LABEL,), log, dry_run)
+                               (CUISINE_LABEL,), log, dry_run, labeled_ids)
+
+
+def tag_tout_api(log: Log = _noop) -> int:
+    """Lance successivement chaque « Tag xxx API » : afrique, oiseaux, reptiles, cuisine.
+
+    Une carte étiquetée par une étape n'est plus retouchée par les suivantes.
+    """
+    labeled_ids: set[str] = set()
+    total = 0
+    steps = [tag_afrique_api, tag_oiseaux_api, tag_reptiles_api, tag_cuisine_api]
+    for step in steps:
+        total += step(log, labeled_ids=labeled_ids)
+    log(f"Tags API terminés : {total} carte(s) étiquetée(s) au total")
+    return total
+
+
+def _fetch_untagged(rarity: str | None) -> list[dict]:
+    """Toutes les cartes sans étiquette (toutes pages), lues en entier avant toute écriture."""
+    items: list[dict] = []
+    for page in range(API_MAX_PAGES):
+        batch = _api_retry(api.fetch_collection, rarity, page)
+        if not batch:
+            break
+        items.extend(batch)
+        time.sleep(api.REQUEST_PAUSE)
+    return items
 
 
 def _api_sweep(rarity: str | None, keywords: list[str], tag_if_match: bool, tag_ids: list[str], dry_run: bool,
-               log: Log = _noop) -> int:
+               labeled_ids: set[str], kept: set[str], log: Log = _noop) -> int:
+    """Étiquette les cartes qui matchent, sans jamais retraiter une carte déjà vue.
+
+    Le site peut renvoyer avec retard des cartes déjà étiquetées : `labeled_ids` et `kept` les filtrent.
+    On relit la collection tant qu'une lecture apporte des cartes nouvelles (borné par API_MAX_SWEEPS).
+    """
     labeled = 0
-    kept = 0  # cartes conservées : elles occupent toujours le début de la liste
-    for _ in range(MAX_ROUNDS):
-        page, offset = kept // api.PAGE_SIZE, kept % api.PAGE_SIZE
-        items = _api_retry(api.fetch_collection, rarity, page)
-        if len(items) <= offset:
+    for _ in range(API_MAX_SWEEPS):
+        items = _fetch_untagged(rarity)
+        fresh = [i for i in items if i["id"] not in labeled_ids and i["id"] not in kept]
+        if not fresh:
             break
-        to_label = [i for i in items if _has_keyword(_normalize(api.card_text(i)), keywords) == tag_if_match]
+        to_label = [i for i in fresh if _has_keyword(_normalize(api.card_text(i)), keywords) == tag_if_match]
         if to_label and not dry_run:
             for tag_id in tag_ids:
                 _api_retry(api.apply_tag, tag_id, [i["id"] for i in to_label])
         for item in to_label:
             log(f"  • {api.card_title(item)}")
+        match_ids = {i["id"] for i in to_label}
+        labeled_ids.update(match_ids)
+        kept.update(i["id"] for i in fresh if i["id"] not in match_ids)
         labeled += len(to_label)
-        tagged = 0 if dry_run else len(to_label)
-        kept = page * api.PAGE_SIZE + len(items) - tagged
-        time.sleep(api.REQUEST_PAUSE)
     return labeled
 
 
@@ -597,11 +622,7 @@ ACTIONS: list[tuple[str, Callable[[Log], object]]] = [
     ("Cartes communes", cartes_communes),
     ("Défausse", defausse_tout),
     ("Défausse API", defausse_api),
-    ("Tag afrique", tag_afrique),
-    ("Tag afrique API", tag_afrique_api),
-    ("Tag oiseaux API", tag_oiseaux_api),
-    ("Tag reptiles API", tag_reptiles_api),
-    ("Tag cuisine API", tag_cuisine_api),
+    ("Tag", tag_tout_api),
     ("Ouvrir paquets", ouvrir_paquets),
     ("Fermer le navigateur", close_browser),
 ]
@@ -612,5 +633,11 @@ SUB_ACTIONS: dict[str, list[tuple[str, Callable[[Log], object]]]] = {
         ("Communes", defausse_communes),
         ("Peu communes", defausse_peu_communes),
         ("Rares", defausse_rares),
+    ],
+    "Tag": [
+        ("Afrique", tag_afrique_api),
+        ("Oiseaux", tag_oiseaux_api),
+        ("Reptiles", tag_reptiles_api),
+        ("Cuisine", tag_cuisine_api),
     ],
 }
