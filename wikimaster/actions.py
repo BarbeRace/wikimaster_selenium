@@ -548,8 +548,8 @@ PACK_OPEN_XPATH = "//button[normalize-space()='Ouvrir']"
 PACK_NEXT_JS = "return [...document.querySelectorAll('button.w-12.h-12')].filter(b => b.offsetParent).pop() || null"
 PACK_WAIT_AUTO = 20  # secondes d'attente automatique avant de demander l'aide de l'utilisateur
 PACK_WAIT_USER = 180  # secondes laissées à l'utilisateur pour valider la vérification anti-bot
-PACK_SCROLL_SECONDS = 2.0  # durée totale pour faire défiler les cartes d'un paquet
-PACK_PAUSE_SECONDS = 1.0  # pause entre deux paquets
+PACK_SCROLL_SECONDS = 1.0  # durée totale pour faire défiler les cartes d'un paquet
+PACK_PAUSE_SECONDS = 0.5  # pause entre deux paquets
 
 
 def _packs_available(driver) -> int:
@@ -616,6 +616,45 @@ def ouvrir_paquets(log: Log = _noop) -> int:
     return opened
 
 
+QSCORE_TOP = 30
+
+
+def analyse_qscore_rarete(rarity: str, rarity_label: str, log: Log = _noop) -> list[tuple[str, int]]:
+    """Classe par Q-Score décroissant les cartes d'une rareté (toute la collection) et logue le top 30."""
+    go_to("/collection", log)
+    cards: dict[str, tuple[str, int]] = {}
+    for page in range(API_MAX_PAGES):
+        batch = _api_retry(api.fetch_collection, rarity, page, False)
+        if not batch:
+            break
+        for item in batch:
+            card = item.get("card") or {}
+            cards[item["id"]] = (api.card_title(item) or "(sans titre)", card.get("q_score") or 0)
+        time.sleep(api.REQUEST_PAUSE)
+    ranking = sorted(cards.values(), key=lambda c: c[1], reverse=True)
+    log(f"{rarity_label} : {len(ranking)} carte(s) analysée(s), top {min(QSCORE_TOP, len(ranking))} par Q-Score")
+    for rank, (title, score) in enumerate(ranking[:QSCORE_TOP], start=1):
+        log(f"{rank}. {title} qscore = {score}")
+    return ranking[:QSCORE_TOP]
+
+
+def analyse_qscore_ultra_rares(log: Log = _noop) -> int:
+    return len(analyse_qscore_rarete("UR", "Ultra rare", log))
+
+
+def analyse_qscore_super_rares(log: Log = _noop) -> int:
+    return len(analyse_qscore_rarete("SR", "Super rare", log))
+
+
+def analyse_qscore_rares(log: Log = _noop) -> int:
+    return len(analyse_qscore_rarete("R", "Rare", log))
+
+
+def analyse_qscore_tout(log: Log = _noop) -> int:
+    """Analyse Q-Score des ultra rares, super rares puis rares."""
+    return sum(step(log) for step in (analyse_qscore_ultra_rares, analyse_qscore_super_rares, analyse_qscore_rares))
+
+
 # (libellé du bouton, fonction)
 ACTIONS: list[tuple[str, Callable[[Log], object]]] = [
     ("Se connecter", login),
@@ -623,6 +662,7 @@ ACTIONS: list[tuple[str, Callable[[Log], object]]] = [
     ("Défausse", defausse_tout),
     ("Défausse API", defausse_api),
     ("Tag", tag_tout_api),
+    ("Analyse QScore", analyse_qscore_tout),
     ("Ouvrir paquets", ouvrir_paquets),
     ("Fermer le navigateur", close_browser),
 ]
@@ -639,5 +679,10 @@ SUB_ACTIONS: dict[str, list[tuple[str, Callable[[Log], object]]]] = {
         ("Oiseaux", tag_oiseaux_api),
         ("Reptiles", tag_reptiles_api),
         ("Cuisine", tag_cuisine_api),
+    ],
+    "Analyse QScore": [
+        ("Ultra rares", analyse_qscore_ultra_rares),
+        ("Super rares", analyse_qscore_super_rares),
+        ("Rares", analyse_qscore_rares),
     ],
 }

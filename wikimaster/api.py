@@ -86,10 +86,12 @@ def get_session() -> Session:
     )
 
 
-def fetch_collection(rarity: str | None, page: int) -> list[dict]:
-    """Une page (50 cartes) de la collection sans étiquette (`rarity` None = toutes). Page vide = fin."""
+def fetch_collection(rarity: str | None, page: int, untagged: bool = True) -> list[dict]:
+    """Une page (50 cartes) de la collection, sans étiquette par défaut (`rarity` None = toutes). Page vide = fin."""
     driver = browser.get_driver()
-    params = {"untagged": "1", "page": page, "stats": "0"}
+    params = {"page": page, "stats": "0"}
+    if untagged:
+        params["untagged"] = "1"
     if rarity:
         params["rarity"] = rarity
     query = urllib.parse.urlencode(params)
