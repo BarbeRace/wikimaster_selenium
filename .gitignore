@@ -221,5 +221,6 @@ __marimo__/
 
 chrome_profile/
 screenshots/
+resultats/
 
 .env

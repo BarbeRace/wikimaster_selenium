@@ -5,10 +5,14 @@ un résultat simple. Pour ajouter une action : écrire la fonction ici, puis
 l'ajouter à la liste ACTIONS en bas de fichier (un bouton apparaîtra dans l'UI).
 """
 
+import csv
+import json
 import re
+import statistics
 import time
 import unicodedata
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 
 from selenium.common.exceptions import TimeoutException
@@ -616,6 +620,71 @@ def ouvrir_paquets(log: Log = _noop) -> int:
     return opened
 
 
+PACK_API_PAUSE_SECONDS = 3.0  # pause entre deux ouvertures par l'API (le site refuse en dessous de ~3 s)
+PACK_API_MAX_WAIT = 120  # secondes : au-delà, on s'arrête plutôt que d'attendre un `retry_after` très lointain
+
+
+def _retry_after_seconds(result: dict) -> float:
+    """Délai demandé par le site (`retry_after`, date ISO) avant la prochaine ouverture."""
+    try:
+        target = datetime.fromisoformat(result["retry_after"].replace("Z", "+00:00"))
+        return max((target - datetime.now(timezone.utc)).total_seconds(), 0) + 0.5
+    except (KeyError, AttributeError, ValueError):
+        return PACK_API_PAUSE_SECONDS
+
+
+def _pack_card_label(card: dict) -> str:
+    inner = card.get("card") if isinstance(card.get("card"), dict) else card
+    title = inner.get("wikipedia_title") or inner.get("title") or inner.get("name") or "?"
+    return f"{inner.get('rarity') or ''} {title}".strip()
+
+
+def ouvrir_paquets_api(log: Log = _noop) -> int:
+    """Ouvre tous les paquets via l'API du site (sans cliquer). Retourne le nombre de paquets ouverts.
+
+    La vérification anti-bot Cloudflare (environ tous les 10 paquets) reste à valider dans Chrome :
+    on rouvre alors un paquet par l'interface, où le site affiche sa case à cocher, puis on reprend par l'API.
+    """
+    driver = browser.get_driver()
+    go_to("/pulls", log)
+    try:
+        wait_for((By.XPATH, PACK_OPEN_XPATH))
+    except TimeoutException:
+        log("Bouton « Ouvrir » introuvable (non connecté ?)")
+        return 0
+
+    opened = 0
+    while True:
+        result = _api_retry(api.open_pack)
+        if result["_status"] == 200 and result.get("cards"):
+            opened += 1
+            log(f"Paquet {opened} : " + ", ".join(_pack_card_label(c) for c in result["cards"])
+                + f" ({result.get('packs_remaining', '?')} restant(s))")
+            if result.get("packs_remaining") == 0:
+                break
+            time.sleep(PACK_API_PAUSE_SECONDS)
+        elif result.get("human_verification_required"):
+            log("Vérification anti-bot demandée : valide-la dans Chrome, la suite reprendra seule")
+            driver.get(config.BASE_URL.rstrip("/") + "/pulls")
+            wait_for((By.XPATH, PACK_OPEN_XPATH))
+            if _packs_available(driver) == 0:
+                break
+            _open_one_pack(driver, log)
+            opened += 1
+            driver.get(config.BASE_URL.rstrip("/") + "/pulls")
+            wait_for((By.XPATH, PACK_OPEN_XPATH))
+        elif result.get("rate_limited") and not result.get("rate_limit_daily") \
+                and (wait := _retry_after_seconds(result)) <= PACK_API_MAX_WAIT:
+            log(f"Ouverture trop rapide : attente de {wait:.0f} s")
+            time.sleep(wait)
+        else:
+            log(f"Arrêt : {result.get('error') or result}")
+            break
+    log(f"Terminé : {opened} paquet(s) ouvert(s)")
+    return opened
+
+
+# Analyse Q-Score : fonctions conservées mais retirées de ACTIONS (peu pertinent)
 QSCORE_TOP = 30
 
 
@@ -655,6 +724,161 @@ def analyse_qscore_tout(log: Log = _noop) -> int:
     return sum(step(log) for step in (analyse_qscore_ultra_rares, analyse_qscore_super_rares, analyse_qscore_rares))
 
 
+MARKET_PAUSE = 2.0  # secondes entre deux lectures d'historique : le site refuse les rafales (« automation_limit »)
+MARKET_MAX_PER_RUN = 400  # cartes lues par clic ; les suivantes sont reprises au clic suivant (cache)
+MARKET_CACHE_HOURS = 24  # une carte lue depuis moins longtemps n'est pas relue
+MARKET_CACHE_SAVE_EVERY = 25
+MARKET_TOP = 50
+MARKET_CACHE_FILE = config.RESULTS_DIR / "market_cache.json"
+
+
+def _load_market_cache() -> dict[str, dict]:
+    try:
+        return json.loads(MARKET_CACHE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_market_cache(cache: dict[str, dict]) -> None:
+    config.RESULTS_DIR.mkdir(exist_ok=True)
+    MARKET_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+
+
+def _market_entry_fresh(entry: dict | None, rarity: str, now: datetime) -> bool:
+    if not entry or entry.get("rarity") != rarity:
+        return False
+    age = now - datetime.fromisoformat(entry["fetched_at"])
+    return age.total_seconds() < MARKET_CACHE_HOURS * 3600
+
+
+def _market_entry(title: str, rarity: str, sales: list[dict], now: datetime) -> dict:
+    """Prix moyen/médian des ventes de la carte à cette rareté (les ventes sous une autre rareté sont ignorées)."""
+    prices = [s["final_price"] for s in sales
+              if s.get("rarity") == rarity and isinstance(s.get("final_price"), (int, float))]
+    return {
+        "title": title, "rarity": rarity, "count": len(prices), "fetched_at": now.isoformat(),
+        "avg": round(statistics.fmean(prices), 1) if prices else None,
+        "median": round(statistics.median(prices), 1) if prices else None,
+    }
+
+
+def _fetch_sales(card_id: str) -> list[dict]:
+    for attempt in range(1, API_RETRIES + 1):
+        try:
+            return api.fetch_card_sales(card_id)
+        except api.AutomationLimitError:
+            raise
+        except (api.ApiError, TimeoutException, OSError):
+            if attempt == API_RETRIES:
+                raise
+            time.sleep(2 * attempt)
+    return []
+
+
+def _collection_cards(rarity: str) -> dict[str, str]:
+    """{id de la carte: titre} pour toute la collection d'une rareté (étiquetées ou non)."""
+    cards: dict[str, str] = {}
+    for page in range(API_MAX_PAGES):
+        batch = _api_retry(api.fetch_collection, rarity, page, False)
+        if not batch:
+            break
+        for item in batch:
+            card_id = (item.get("card") or {}).get("id")
+            if card_id:
+                cards[card_id] = api.card_title(item) or "(sans titre)"
+        time.sleep(api.REQUEST_PAUSE)
+    return cards
+
+
+def market_rarete(rarity: str, rarity_label: str, log: Log = _noop) -> tuple[int, bool]:
+    """Prix de vente moyen des cartes d'une rareté (historique des enchères, infos marché Pro).
+
+    Lit l'historique de chaque carte de la collection à rythme lent, au plus MARKET_MAX_PER_RUN par appel ;
+    les lectures sont conservées dans un cache, donc relancer reprend là où on s'est arrêté.
+    Logue le top MARKET_TOP par prix moyen et écrit la liste complète dans resultats/market_<rareté>.csv.
+    Retourne (cartes restant à lire, True si le site a refusé les requêtes).
+    """
+    go_to("/collection", log)
+    cards = _collection_cards(rarity)
+    cache = _load_market_cache()
+    now = datetime.now(timezone.utc)
+    todo = [cid for cid in cards if not _market_entry_fresh(cache.get(cid), rarity, now)]
+    batch = todo[:MARKET_MAX_PER_RUN]
+    log(f"{rarity_label} : {len(cards)} carte(s), {len(cards) - len(todo)} déjà lue(s) récemment, "
+        f"{len(batch)} à lire maintenant (≈ {len(batch) * MARKET_PAUSE / 60:.0f} min)")
+
+    blocked = False
+    try:
+        for done, card_id in enumerate(batch, start=1):
+            try:
+                sales = _fetch_sales(card_id)
+            except api.AutomationLimitError as error:
+                log(f"⚠ Le site refuse les requêtes : {error} Analyse interrompue, relance plus tard pour continuer.")
+                blocked = True
+                break
+            cache[card_id] = _market_entry(cards[card_id], rarity, sales, datetime.now(timezone.utc))
+            if done % MARKET_CACHE_SAVE_EVERY == 0:
+                _save_market_cache(cache)
+                log(f"  … {done}/{len(batch)} carte(s) lue(s)")
+            time.sleep(MARKET_PAUSE)
+    finally:
+        _save_market_cache(cache)
+
+    entries = [(cid, cache[cid]) for cid in cards if cache.get(cid, {}).get("rarity") == rarity]
+    ranking = sorted((e for _, e in entries if e["count"]), key=lambda e: e["avg"], reverse=True)
+    remaining = sum(1 for cid in cards if not cache.get(cid) or cache[cid].get("rarity") != rarity)
+    _write_market_csv(rarity, [e for _, e in entries])
+    log(f"{rarity_label} : {len(entries)}/{len(cards)} carte(s) analysée(s), {len(ranking)} avec des ventes "
+        f"— top {min(MARKET_TOP, len(ranking))} par prix moyen de vente")
+    for rank, entry in enumerate(ranking[:MARKET_TOP], start=1):
+        log(f"{rank}. {entry['title']} : moyenne = {entry['avg']:g} (médiane {entry['median']:g}, {entry['count']} vente(s))")
+    log(f"Liste complète : {config.RESULTS_DIR / f'market_{rarity}.csv'}")
+    if remaining:
+        log(f"{remaining} carte(s) pas encore analysée(s) : relance pour continuer")
+    return remaining, blocked
+
+
+def _write_market_csv(rarity: str, entries: list[dict]) -> None:
+    config.RESULTS_DIR.mkdir(exist_ok=True)
+    rows = sorted(entries, key=lambda e: (e["avg"] is None, -(e["avg"] or 0)))
+    with open(config.RESULTS_DIR / f"market_{rarity}.csv", "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f, delimiter=";")
+        writer.writerow(["Carte", "Prix moyen", "Prix médian", "Nb ventes", "Lu le"])
+        for e in rows:
+            writer.writerow([e["title"], e["avg"], e["median"], e["count"], e["fetched_at"][:16]])
+
+
+def market_ultra_rares(log: Log = _noop) -> int:
+    return market_rarete("UR", "Ultra rare", log)[0]
+
+
+def market_super_rares(log: Log = _noop) -> int:
+    return market_rarete("SR", "Super rare", log)[0]
+
+
+def market_rares(log: Log = _noop) -> int:
+    return market_rarete("R", "Rare", log)[0]
+
+
+def market_peu_communes(log: Log = _noop) -> int:
+    return market_rarete("PC", "Peu commune", log)[0]
+
+
+def market_communes(log: Log = _noop) -> int:
+    return market_rarete("C", "Commune", log)[0]
+
+
+def market_tout(log: Log = _noop) -> int:
+    """Market des ultra rares, super rares, rares puis peu communes (les communes : bouton dédié, très longues)."""
+    total = 0
+    for rarity, label in (("UR", "Ultra rare"), ("SR", "Super rare"), ("R", "Rare"), ("PC", "Peu commune")):
+        remaining, blocked = market_rarete(rarity, label, log)
+        total += remaining
+        if blocked:
+            break
+    return total
+
+
 # (libellé du bouton, fonction)
 ACTIONS: list[tuple[str, Callable[[Log], object]]] = [
     ("Se connecter", login),
@@ -662,8 +886,9 @@ ACTIONS: list[tuple[str, Callable[[Log], object]]] = [
     ("Défausse", defausse_tout),
     ("Défausse API", defausse_api),
     ("Tag", tag_tout_api),
-    ("Analyse QScore", analyse_qscore_tout),
+    ("Market", market_tout),
     ("Ouvrir paquets", ouvrir_paquets),
+    ("Ouvrir paquets API", ouvrir_paquets_api),
     ("Fermer le navigateur", close_browser),
 ]
 
@@ -680,9 +905,11 @@ SUB_ACTIONS: dict[str, list[tuple[str, Callable[[Log], object]]]] = {
         ("Reptiles", tag_reptiles_api),
         ("Cuisine", tag_cuisine_api),
     ],
-    "Analyse QScore": [
-        ("Ultra rares", analyse_qscore_ultra_rares),
-        ("Super rares", analyse_qscore_super_rares),
-        ("Rares", analyse_qscore_rares),
+    "Market": [
+        ("Ultra rares", market_ultra_rares),
+        ("Super rares", market_super_rares),
+        ("Rares", market_rares),
+        ("Peu communes", market_peu_communes),
+        ("Communes", market_communes),
     ],
 }

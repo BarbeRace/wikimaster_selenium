@@ -6,6 +6,8 @@ BASE_URL = "https://www.wiki-masters.com/"
 ROOT_DIR = Path(__file__).resolve().parent.parent
 # Profil Chrome dédié : conserve cookies/session entre les lancements (reste connecté).
 PROFILE_DIR = ROOT_DIR / "chrome_profile"
+# Résultats d'analyse (CSV du marché, cache des ventes déjà lues)
+RESULTS_DIR = ROOT_DIR / "resultats"
 # Listes de mots-clés : un mot-clé par ligne (insensible à la casse et aux accents, recherche par sous-chaîne)
 KEYWORDS_DIR = ROOT_DIR / "mots_cles"
 DEFAUSSE_KEYWORDS_FILE = KEYWORDS_DIR / "mots_cles_defausse.txt"

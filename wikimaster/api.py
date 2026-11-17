@@ -34,6 +34,10 @@ class ApiError(RuntimeError):
     pass
 
 
+class AutomationLimitError(ApiError):
+    """Le site refuse les requêtes (`automation_limit`) : inutile de réessayer tout de suite."""
+
+
 def _read_auth_cookie(driver) -> tuple[str, str]:
     """Retourne (nom du projet Supabase, JSON de session) depuis les cookies `sb-<projet>-auth-token.N`."""
     chunks: dict[int, str] = {}
@@ -107,6 +111,62 @@ def fetch_collection(rarity: str | None, page: int, untagged: bool = True) -> li
     if result["status"] != 200:
         raise ApiError(f"Collection : HTTP {result['status']} {result['body'][:120]}")
     return json.loads(result["body"]).get("collection") or []
+
+
+def fetch_card_sales(card_id: str) -> list[dict]:
+    """Historique des ventes aux enchères d'une carte (`/api/marketplace/cards/<id>/sales`, réservé Pro).
+
+    Le site renvoie au plus ~200 ventes récentes, chacune avec `final_price`, `settled_at` et la `rarity`
+    de la carte au moment de la vente (une même carte a pu être vendue sous une autre rareté).
+    """
+    driver = browser.get_driver()
+    result = driver.execute_async_script(
+        "const done = arguments[arguments.length - 1];"
+        "fetch(arguments[0], {credentials: 'same-origin'})"
+        ".then(async r => done({status: r.status, body: await r.text()}))"
+        ".catch(e => done({status: 0, body: String(e)}));",
+        f"/api/marketplace/cards/{urllib.parse.quote(card_id)}/sales",
+    )
+    status, body = result["status"], result["body"]
+    if status == 401:
+        raise ApiError("Session expirée : reconnecte-toi")
+    try:
+        data = json.loads(body)
+    except ValueError:
+        data = {}
+    code = data.get("code") if isinstance(data, dict) else None
+    if code == "automation_limit":
+        raise AutomationLimitError(data.get("error") or "Limite d'automatisation atteinte")
+    if code == "pro_required":
+        raise ApiError("Les infos marché nécessitent l'abonnement Pro")
+    if status != 200 or not isinstance(data, dict):
+        raise ApiError(f"Ventes : HTTP {status} {body[:120]}")
+    return data.get("sales") or []
+
+
+def open_pack() -> dict:
+    """Ouvre un paquet via `POST /api/packs/open` (appel same-origin depuis /pulls).
+
+    Retourne la réponse JSON du site, avec `_status` (code HTTP). Quand le site exige la vérification
+    anti-bot, la réponse contient `human_verification_required` : elle doit être validée dans le navigateur.
+    """
+    driver = browser.get_driver()
+    result = driver.execute_async_script(
+        "const done = arguments[arguments.length - 1];"
+        "fetch('/api/packs/open', {method: 'POST', credentials: 'same-origin'})"
+        ".then(async r => done({status: r.status, body: await r.text()}))"
+        ".catch(e => done({status: 0, body: String(e)}));"
+    )
+    if result["status"] == 401:
+        raise ApiError("Session expirée : reconnecte-toi")
+    try:
+        data = json.loads(result["body"])
+    except ValueError:
+        data = {"error": result["body"][:120]}
+    if not isinstance(data, dict):
+        data = {"error": str(data)[:120]}
+    data["_status"] = result["status"]
+    return data
 
 
 def card_title(item: dict) -> str:
